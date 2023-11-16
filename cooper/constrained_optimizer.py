@@ -14,6 +14,12 @@ import torch
 
 from .problem import CMPState, Formulation
 
+try:
+    from torchmin import Minimizer as torchmin_optimizer
+    torchmin_avail = True
+except Exception:
+    torchmin_avail = False
+
 
 class ConstrainedOptimizer:
     """
@@ -70,6 +76,10 @@ class ConstrainedOptimizer:
     ):
         self.formulation = formulation
         self.cmp = self.formulation.cmp
+        if torchmin_avail:
+            self.primal_torchmin = isinstance(primal_optimizer, torchmin_optimizer)
+        else:
+            self.primal_torchmin = False
         self.primal_optimizer = primal_optimizer
         self.dual_optimizer = dual_optimizer
         self.dual_scheduler = dual_scheduler
@@ -78,7 +88,7 @@ class ConstrainedOptimizer:
         self.dual_restarts = dual_restarts
 
         self.sanity_checks()
-
+        
     def sanity_checks(self):
         """
         Perform sanity checks on the initialization of ``ConstrainedOptimizer``.
@@ -196,11 +206,15 @@ class ConstrainedOptimizer:
             assert self.dual_optimizer is not None and callable(self.dual_optimizer)
             # Checks if needed and instantiates dual_optimizer
             self.dual_optimizer = self.dual_optimizer(self.formulation.dual_parameters)
-
+            if torchmin_avail:
+                if isinstance(self.dual_optimizer, torchmin_optimizer):
+                    raise NotImplementedError("torchmin optimizers not supported for dual variables.")
             if self.dual_scheduler is not None:
                 assert callable(self.dual_scheduler), "dual_scheduler must be callable"
                 # Instantiates the dual_scheduler
                 self.dual_scheduler = self.dual_scheduler(self.dual_optimizer)
+                if isinstance(self.dual_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    raise NotImplementedError("ReduceLROnPlateau scheduler not supported.")
 
         if self.is_extrapolation or self.alternating:
             assert closure is not None
@@ -228,10 +242,20 @@ class ConstrainedOptimizer:
 
             # After this, the calls to `step` will update the stored copies with
             # the newly computed gradients
-            self.primal_optimizer.step()
+            if self.primal_torchmin:
+                def opt_closure():
+                    self.zero_grad(ignore_dual=True)
+                    L = self.formulation.composite_objective(closure,
+                            *closure_args, **closure_kwargs)  # type: ignore
+                    ## update gradients of dual variables for stability
+                    ## tested up to 64 micro-iterations: not needed?
+#                    self.dual_step()
+                    return L
+                self.primal_optimizer.step(opt_closure)
+            else:
+                self.primal_optimizer.step()
             if self.cmp.is_constrained:
                 self.dual_step()
-
                 if self.dual_scheduler is not None:
                     # Do a step on the dual scheduler after the actual step on
                     # the dual parameters. Intermediate updates that take
@@ -240,11 +264,17 @@ class ConstrainedOptimizer:
                     self.dual_scheduler.step()
 
         else:
-
-            self.primal_optimizer.step()
+            if self.primal_torchmin:
+                def opt_closure():
+                    self.zero_grad(ignore_dual=True)
+                    L = self.formulation.composite_objective(closure,
+                            *closure_args, **closure_kwargs)  # type: ignore
+                    return L
+                self.primal_optimizer.step(opt_closure)
+            else:
+                self.primal_optimizer.step()
 
             if self.cmp.is_constrained:
-
                 if self.alternating:
                     # TODO: add test for this
 
@@ -269,7 +299,6 @@ class ConstrainedOptimizer:
                     )
 
                 self.dual_step()
-                
                 if self.dual_scheduler is not None:
                     self.dual_scheduler.step()
 
@@ -278,9 +307,10 @@ class ConstrainedOptimizer:
         # Flip gradients for multipliers to perform ascent.
         # We only do the flipping *right before* applying the optimizer step to
         # avoid accidental double sign flips.
-        for multiplier in self.formulation.state():
-            if multiplier is not None:
-                multiplier.grad.mul_(-1.0)
+        ## MS: switch to dual optimizer in 'maximize' mode to avoid in-place operations
+#        for multiplier in self.formulation.state():
+#            if multiplier is not None:
+#                multiplier.grad.mul_(-1.0)
 
         # Update multipliers based on current constraint violations (gradients)
         if call_extrapolation:

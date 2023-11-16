@@ -24,7 +24,7 @@ def partial_optimizer(optim_cls: Type[torch.optim.Optimizer], **optim_kwargs):
     """
 
     class PartialOptimizer(optim_cls):
-        __init__ = functools.partialmethod(optim_cls.__init__, **optim_kwargs)
+        __init__ = functools.partialmethod(optim_cls.__init__, maximize=True, **optim_kwargs)
 
     return PartialOptimizer
 
